@@ -2,8 +2,12 @@
 #include <winternl.h>
 #include <TlHelp32.h>
 
-char *process = "SoTGame.exe";
-HANDLE handle;
+//
+// Dumper options.
+//
+
+char *process = "SoTGame";
+char *extension = "_dump.exe";
 
 typedef unsigned long long u64;
 typedef unsigned long      u32;
@@ -13,6 +17,8 @@ typedef signed long long   s64;
 typedef int                s32;
 typedef signed short       s16;
 typedef signed char        s8;
+
+HANDLE handle;
 
 inline
 bool sig_is_equal(u8 *data, u8 *sig, u64 size) {
@@ -139,7 +145,7 @@ int get_process_id(char *name) {
     PROCESSENTRY32 process_entry = { sizeof(PROCESSENTRY32) };
     
     while (Process32Next(snapshot, &process_entry)) {
-        if (strings_are_equal(process_entry.szExeFile, name)) {
+        if (string_is_within(process_entry.szExeFile, name)) {
             CloseHandle(snapshot);
             return process_entry.th32ProcessID;
         }
@@ -255,9 +261,11 @@ u64 find_offset_from_sig(u8 *base, u64 size, u8 *sig, u64 sig_size) {
 void dump_offsets(u8 *base, u64 size) {
     u8 objects_sig[] = { 0x48, 0x8B, 0x05, 0x00, 0x00, 0x00, 0x00, 0x8B, 0x54, 0xC8, 0x08 };
     u8 names_sig[] = { 0x48, 0x8b, 0x3d, 0x00, 0x00, 0x00, 0x00, 0x48, 0x85, 0xff, 0x75, 0x3c };
+    u8 static_load_object_internal_sig[] = { 0xE8, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8B, 0xF0, 0x48, 0x85, 0xC0, 0x0F, 0x85, 0xAD, 0x03 };
 
     u64 obj_objects = find_offset_from_sig(base, size, objects_sig, sizeof(objects_sig));
     u64 global_names = find_offset_from_sig(base, size, names_sig, sizeof(names_sig));
+    u64 static_load_object_internal = find_offset_from_sig(base, size, static_load_object_internal_sig, sizeof(static_load_object_internal_sig));
 
     u8 *viewport = find_object(base + obj_objects, base + global_names, "AthenaGameViewportClient", "AthenaGameEngine", "AthenaGameViewportClient");
     u8 *ship_size = find_object(base + obj_objects, base + global_names, "Class", "Athena", "ShipSize");
@@ -272,6 +280,10 @@ void dump_offsets(u8 *base, u64 size) {
 
     write_string("global names offset: 0x");
     write_pointer(global_names);
+    write_string("\n");
+
+    write_string("static load object internal offset: 0x");
+    write_pointer(static_load_object_internal);
     write_string("\n");
     
     write_string("process event offset: 0x");
@@ -318,10 +330,54 @@ int mainCRTStartup() {
     auto header_nt = (IMAGE_NT_HEADERS *)(header_pe + header_dos->e_lfanew);
     
     write_string("dumping offsets\n");
-    dump_offsets(base, header_nt->OptionalHeader.SizeOfImage);
-    
+    u64 size = header_nt->OptionalHeader.SizeOfImage;
+    dump_offsets(base, size);
+
+    auto buffer = (u8 *)VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!buffer) return 0;
+
+    ReadProcessMemory(handle, base, buffer, size, NULL);
+    write_string("copied process\n");
+
     CloseHandle(handle);
     write_string("closed handle\n");
+
+    auto new_header_dos = (IMAGE_DOS_HEADER *)buffer;
+    auto new_header_nt = (IMAGE_NT_HEADERS *)(buffer + new_header_dos->e_lfanew);
+
+    //
+    // Loop all sections for raw data, we don't care about other data since it is used after runtime..
+    //
+    
+    auto s = IMAGE_FIRST_SECTION(new_header_nt);
+    for (u32 i = 0; i != new_header_nt->FileHeader.NumberOfSections; i++, s++) {
+        s->PointerToRawData = s->VirtualAddress;
+        s->SizeOfRawData = s->Misc.VirtualSize;
+    }
+
+    write_string("fixed sections\n");
+
+    // Kind if weird but whatever...
+    char *version = "_uwp";
+    if (FindWindowA("UnrealWindow", "Sea of Thieves")) version = "_win32";
+    u64 version_len = strlen(version);
+    
+    char dump_name[64];
+    u64 name_len = strlen(process);
+    u64 ext_len = strlen(extension);
+    memcpy(dump_name, process, name_len);
+    memcpy(dump_name + name_len, version, version_len);
+    memcpy(dump_name + name_len + version_len, extension, ext_len);
+    dump_name[name_len + version_len + ext_len] = 0;
+
+    HANDLE file_handle = CreateFileA(dump_name, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file_handle == INVALID_HANDLE_VALUE) return 0;
+
+    write_string("writing to file\n");
+
+    u32 written;
+    WriteFile(file_handle, buffer, (u32)size, &written, NULL);
+    CloseHandle(file_handle);
     write_string("done\n");
     return 0;
 }
